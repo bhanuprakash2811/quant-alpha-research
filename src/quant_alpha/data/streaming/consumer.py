@@ -1,6 +1,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 from quant_alpha.data.schema import (
     OrderBookSnapshot,
@@ -11,8 +12,16 @@ from quant_alpha.data.streaming.event_bus import (
     MarketDataEvent,
     MarketDataEventBus,
 )
+from quant_alpha.data.streaming.health import (
+    FeedHealthSnapshot,
+    MarketDataFeedMonitor,
+)
 from quant_alpha.features.market_depth.incremental import (
     IncrementalOrderBook,
+)
+from quant_alpha.features.market_state import (
+    MarketState,
+    MarketStateEngine,
 )
 from quant_alpha.features.microstructure.engine import (
     MicrostructureEngine,
@@ -37,6 +46,8 @@ class MarketDataProcessingResult:
     trade_flow: TradeFlowSnapshot | None = None
     ofi: OFIResult | None = None
     microstructure: MicrostructureFeatures | None = None
+    market_state: MarketState | None = None
+    feed_health: FeedHealthSnapshot | None = None
 
 
 @dataclass
@@ -57,6 +68,8 @@ class MarketDataConsumer:
 
     def __init__(self) -> None:
         self._instruments: dict[str, _InstrumentState] = {}
+        self._market_state = MarketStateEngine()
+        self._feed_monitor = MarketDataFeedMonitor()
 
     def register_instrument(self, instrument_id: str) -> None:
         """Create analytics engines for an instrument."""
@@ -72,6 +85,7 @@ class MarketDataConsumer:
             order_book=IncrementalOrderBook(instrument_id),
             trade_flow=TradeFlowEngine(instrument_id),
         )
+        self._market_state.register_instrument(instrument_id)
 
     def process_event(
         self,
@@ -89,12 +103,11 @@ class MarketDataConsumer:
         if isinstance(event, TradeEvent):
             trade_flow = state.trade_flow.process_trade(event)
 
-            return MarketDataProcessingResult(
+            result = MarketDataProcessingResult(
                 event=event,
                 trade_flow=trade_flow,
             )
-
-        if isinstance(event, OrderBookSnapshot):
+        elif isinstance(event, OrderBookSnapshot):
             # Validate analytics before replacing the current book.
             microstructure = MicrostructureEngine.calculate(event)
 
@@ -102,13 +115,12 @@ class MarketDataConsumer:
             snapshot = state.order_book.get_snapshot()
             state.previous_snapshot = snapshot
 
-            return MarketDataProcessingResult(
+            result = MarketDataProcessingResult(
                 event=event,
                 book_snapshot=snapshot,
                 microstructure=microstructure,
             )
-
-        if isinstance(event, OrderBookUpdate):
+        elif isinstance(event, OrderBookUpdate):
             previous = state.order_book.get_snapshot()
             current = state.order_book.apply_update(event)
 
@@ -123,16 +135,60 @@ class MarketDataConsumer:
             microstructure = MicrostructureEngine.calculate(current)
             state.previous_snapshot = current
 
-            return MarketDataProcessingResult(
+            result = MarketDataProcessingResult(
                 event=event,
                 book_snapshot=current,
                 ofi=ofi,
                 microstructure=microstructure,
             )
+        else:
+            # Defensive guard in case the event union is extended.
+            raise TypeError(
+                f"Unsupported market event type: {type(event).__name__}."
+            )
 
-        # Defensive guard in case the event union is extended.
-        raise TypeError(
-            f"Unsupported market event type: {type(event).__name__}."
+        market_state = self._market_state.update(
+            event,
+            book_snapshot=result.book_snapshot,
+            trade_flow=result.trade_flow,
+            ofi=result.ofi,
+            microstructure=result.microstructure,
+        )
+        self._feed_monitor.record_event(event)
+        feed_health = self._feed_monitor.get_health(
+            provider=event.provider,
+            instrument_id=event.instrument_id,
+            now=event.received_timestamp,
+        )
+
+        return MarketDataProcessingResult(
+            event=result.event,
+            book_snapshot=result.book_snapshot,
+            trade_flow=result.trade_flow,
+            ofi=result.ofi,
+            microstructure=result.microstructure,
+            market_state=market_state,
+            feed_health=feed_health,
+        )
+
+    def get_market_state(self, instrument_id: str) -> MarketState:
+        """Return the latest unified state for a registered instrument."""
+
+        return self._market_state.get_state(instrument_id)
+
+    def get_feed_health(
+        self,
+        provider: str,
+        instrument_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> FeedHealthSnapshot:
+        """Return current freshness and delivery latency for a feed."""
+
+        return self._feed_monitor.get_health(
+            provider,
+            instrument_id,
+            now=now,
         )
 
     async def run(

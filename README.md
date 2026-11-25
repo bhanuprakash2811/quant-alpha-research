@@ -46,6 +46,16 @@ The project is designed to build a reliable foundation for processing market eve
 - Cumulative volume delta (CVD).
 - Session and interval statistics.
 
+### 7. Paper Execution
+- Market orders consume currently displayed opposing depth and expire any remainder.
+- Limit orders remain open and are checked against later order-book snapshots.
+- Fill history, positions, average price, realized/unrealized P&L, cash, and fees.
+- Configurable proportional commission for simulated fills.
+- Feed freshness and delivery-latency snapshots for processed events.
+
+Paper fills assume displayed depth is executable. The simulator does not model
+queue position, hidden liquidity, venue priority, or order latency.
+
 ## Technology Stack
 
 | Category | Technologies |
